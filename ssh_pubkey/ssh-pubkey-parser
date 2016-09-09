@@ -1,0 +1,315 @@
+#!/usr/bin/python3
+
+import codecs
+from datetime import datetime, timezone
+import getopt
+import hashlib
+import re
+import sys
+
+debug = False
+
+class Error(Exception):
+    pass
+
+class Key:
+    def __init__(self, key_line):
+        self.key_line_original = key_line.strip()
+        self.key_base64 = self.key_line_original.split(' ', 2)[1]
+        self.key_binary = codecs.decode(self.key_base64.encode(), 'base64')
+
+        ## hex representation of an md5 hash bytes separated by ':'
+        self.fpr_md5 = ':'.join(re.findall('..', hashlib.md5(self.key_binary).hexdigest()))
+
+        ## base64 encoded sha256 hash without padding
+        self.fpr_sha256 = 'SHA256:' + codecs.encode(hashlib.sha256(self.key_binary).digest(), 'base64').decode().rstrip('=\n')
+
+    def get_line(self, options):
+        return options + ' ' + self.key_line_original if options else self.key_line_original
+        
+    def get_yaml(self, identifier):
+        line = lambda fpr:  fpr.ljust(51) + ': ' + identifier
+        return '\n'.join((line(self.fpr_sha256), line(self.fpr_md5)))
+
+class Owner:
+    def __init__(self):
+        self.name = None
+        self.full_name = None
+        self.permissions_text = None
+        self.permission_sets = []
+        self.comment = ''
+        self.options = []
+        self.keys = []
+
+    def add_key(self, key_line):
+        key = Key(key_line)
+        self.keys.append(key)
+
+        return key
+
+    def set_full_name(self, full_name):
+        if self.full_name != None: raise Error("Trying to to overwrite name '%s' with '%s'." % (self.full_name, full_name))
+        self.full_name = full_name
+
+    def set_name(self, name):
+        if self.name != None: raise Error("Trying to to overwrite id '%s' with '%s'." % (self.name, name))
+        if not re.fullmatch('[\da-z_@-]+', name): raise Error("Illegal character in id '%s'" % name)
+        self.name = name
+
+    def add_permissions(self, permissions_value, roles):
+        tmp = permissions_value.split(' ', 1)
+        if  2 > len(tmp) < 0: raise Error("Invalid value")
+        permissions= tmp[0]
+        options = tmp[1].strip() if len(tmp) > 1 else None
+
+        self.permissions_text = permissions
+        self.permission_sets.append(Permissions(permissions, options, roles))
+
+    def set_comment(self, comment):
+        if self.comment != '': raise Error("Trying to to overwrite comment '%s' with '%s'." % (self.comment, comment))
+        self.comment = comment
+
+    def __str__(self):
+        info = '### %s (%s) ###' % (self.full_name, self.name)
+        if self.comment:
+            info += '\n# comment: ' + self.comment
+        return info
+
+    def get_permissions(self, login):
+        for pset in self.permission_sets:
+            if any(p.perm.fullmatch(login) for p in pset if p.negate == True):
+                continue
+
+            if any(p.perm.fullmatch(login) for p in pset if p.negate == False):
+                return pset
+        return None
+
+    def get_yaml(self):
+        return str(self) + '\n' + '\n'.join(k.get_yaml(self.name) for k in self.keys)
+
+    def get_auth(self, login):
+        info = str(self) + '\n'
+        applying_permissions_set = self.get_permissions(login)
+        if debug and self.permission_sets:
+            info += '#\n'
+            for count, permission_set in enumerate(self.permission_sets, start=1):
+                info += '#\trule %d\n' % count
+                info += '#\t\trule applies        : %s\n' % str(applying_permissions_set is permission_set)
+                info += '#\t\tpermissions text    : %s\n' % permission_set.permissions_text
+                info += '#\t\tallowed (regex)     : %s\n' % ', '.join("'" + p.perm.pattern + "'" for p in permission_set if p.negate == False)
+                info += '#\t\tprohibited (regex)  : %s\n' % ', '.join("'" + p.perm.pattern + "'" for p in permission_set if p.negate)
+                info += '#\t\toptions             : %s\n' % (permission_set.options if permission_set.options else '')
+            info += '#\n'
+        if applying_permissions_set:
+            info += '\n'.join(k.get_line(applying_permissions_set.options) for k in self.keys)
+        else:
+            info += '\n'.join('#' + k.get_line('') for k in self.keys)
+        return info
+
+    def validate(self):
+        missing = []
+        if self.name == None:        missing.append("id")
+        if self.full_name == None:   missing.append("full_name")
+        if self.permission_sets == None: massing.append("name")
+
+        if missing:
+            raise Error("The following properties are missing: %s" % ','.join(missing))
+
+
+class Permissions:
+    class Permission:
+        def __init__(self, perm, negate):
+            self.negate = negate
+            self.perm = re.compile(perm)
+            self.options = None
+
+        def __str__(self):
+            print(self.perm.pattern)
+                
+
+    def __init__(self, permissions, options, roles):
+        self.options = options
+        self.permissions_text = permissions
+        self.permissions = []
+        self.add_permissions(permissions, roles)
+
+    def __iter__(self):
+        yield from self.permissions
+
+    def add_permissions(self, permissions, roles):
+        if isinstance(permissions, type(self)):
+            self.permissions.extend(permissions)
+        else:
+            permissions = [ p.strip() for p in permissions.split(',') ]
+
+            for perm in permissions:
+                if perm == "":    # empty regex maches everything!
+                    continue
+
+                negate = False
+                if perm.startswith('!'):
+                    negate = True
+                    perm = perm[1:]
+
+                if perm.startswith('@'):
+                    if negate == True:
+                        raise Error("Negation of roles is not supported.")
+                    if not perm in roles:
+                        raise Error("Unknown role '%s' referenced." % perm)
+
+                    self.permissions.extend(roles[perm].permissions)
+                else:
+                    self.permissions.append(self.Permission(perm, negate))
+
+
+def parse_line(line, line_no, owners, owner, keys, roles):
+    role_start_regex = re.compile('\s*#--')
+    role_regex = re.compile('\s*#--\s*(@[a-z\d_-]+)\s*:\s*(.*?)(#.*)?\s*')
+    property_start_regex = re.compile('\s*#-')
+    property_regex = re.compile('\s*#-\s*([a-z\d_-]+)\s*:\s*(.*?)(#.*)?\s*')
+
+
+    if role_start_regex.match(line):
+        match = role_regex.fullmatch(line)
+        if not match:
+            raise Error("Line started with '#--' but is not a valid role declarition.")
+        if owner != None:
+            raise Error("Role declaritions must not be mixed with properties and keys. Please place the line at beginning of file.")
+
+        role_name = match.group(1)
+        role_permissions = match.group(2)
+
+        if role_name in roles:
+            raise Error("Redeclaration of role '%s' not allowed." % (role_name))
+
+        roles[role_name] = Permissions(role_permissions, None, roles)
+    elif property_start_regex.match(line):
+        if owner != None and owner.keys:
+            raise Error("Property must appear before any ssh key")
+
+        match = property_regex.fullmatch(line)
+        if not match:
+            raise Error("Line started with '#-' but is not a valid property key value pair.")
+        key = match.group(1)
+        value = match.group(2)
+
+        if owner == None:
+            owner = Owner()
+            owners.append(owner)
+
+        if key == 'name':
+            owner.set_full_name(value)
+        elif key == 'id':
+            owner.set_name(value)
+        elif key == 'rights':
+            owner.add_permissions(value, roles)
+        elif key == 'comment':
+            owner.set_comment(value)
+        else:
+            raise Error("Unknown property '%s'." % key)
+    elif re.match('^\s*#', line):
+        pass
+    elif line.isspace():
+        if owner != None: owner.validate()
+        owner = None
+    else:
+        if owner == None:
+            raise Error("Unexpected occurance of a ssh key. Expected properties.")
+
+        owner.validate()
+
+        key = owner.add_key(line)
+
+        if key in keys:
+            raise Error("Keys on lines %d and %d are identical." % (keys[key], line_no))
+        keys[key] = line_no
+
+    return owners, owner, keys, roles
+
+def parse_file(path):
+    keys = {}
+    owners = []
+    roles = {}
+    with open(path) as f:
+        owner = None
+        for line_no, line in enumerate(f, start=1):
+            try:
+                owners, owner, keys, roles = parse_line(line, line_no, owners, owner, keys, roles)
+            except Exception as e:
+                raise Error("Error while parsing line %d: %s" % (line_no, e)) from e
+
+        if owner: owner.validate()  # is not validated otherwise if there is LF at EOF
+    return owners
+
+
+def print_data(formatter, condition=lambda owner: True, comment=''):
+    def print_block(title, print_system):
+        chars = len(title) + 8 if len(title) > 34 else 40
+        text = '\n\n'.join(formatter(o) for o in owners if condition(o) and o.keys and o.name.startswith("system-") == print_system)
+        if text:
+            print()
+            print('#'*chars)
+            print('### %s ###' % title.center(chars-8))
+            print('#'*chars)
+            print()
+            print(text)
+
+    print('### generatated on %s %s###' %(datetime.utcnow().replace(tzinfo=timezone.utc).astimezone().isoformat(), comment + ' ' if comment else ''))
+    print_block('User Keys', False)
+    print_block('System Keys', True)
+
+
+def usage(progname):
+    print('Usage:', file=sys.stderr)
+    print('\t%s [-d|--debug] allauth FILE USER@HOST' % progname)
+    print('\t%s [-d|--debug] auth FILE USER@HOST [--domain DOMAIN]' % progname)
+    print('\t%s [-d|--debug] hash FILE' % progname)
+    exit(1)
+
+
+if __name__ == '__main__':
+    try:
+        opts, args = getopt.gnu_getopt(sys.argv[1:], 'd', ['debug', 'domain='])
+    except getopt.GetoptError as e:
+        print('ERROR:', e)
+        print()
+        usage(sys.argv[0])
+
+    domain = None
+    for key, value in opts:
+        if key in ['-d', '--debug']:
+            debug = True
+        elif key == '--domain':
+            domain = value
+        else:
+            raise Error()
+
+    if len(args) < 2:
+        usage(sys.argv[0])
+
+    command = args[0]
+    owners = parse_file(args[1])
+
+    owners.sort(key=lambda i: (i.full_name.split(' '), i.name))
+
+    if command == 'hash':
+        print_data(lambda owner: owner.get_yaml())
+    elif command == 'allauth':
+        if len(args) != 3:
+            usage(sys.argv[0])
+
+        print()
+        print_data(lambda owner: owner.get_auth(args[2]))
+    elif command == 'auth':
+        if len(args) != 3:
+            usage(sys.argv[0])
+
+        login = args[2]
+        if domain is not None and login.endswith('.' + domain):
+            login = login[:-len(domain) - 1]
+        if not re.fullmatch('[a-z\d_-]+@[a-z\d_-]+', login):
+            raise Error("Invalid user/host name: '%s'" % login)
+
+        print_data(lambda owner: owner.get_auth(login), lambda owner: owner.get_permissions(login), 'for ' + login)
+    else:
+        raise Error("Unknown command '%s'." % command)
