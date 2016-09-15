@@ -1,7 +1,6 @@
 #!/usr/bin/python3
 
 import codecs
-from datetime import datetime, timezone
 import getopt
 import hashlib
 import re
@@ -253,8 +252,9 @@ def print_data(formatter, condition=lambda owner: True, comment=''):
             print('#'*chars)
             print()
             print(text)
+    if comment:
+        print('### %s ###' % comment)
 
-    print('### generatated on %s %s###' %(datetime.utcnow().replace(tzinfo=timezone.utc).astimezone().isoformat(), comment + ' ' if comment else ''))
     print_block('User Keys', False)
     print_block('System Keys', True)
 
@@ -310,6 +310,7 @@ if __name__ == '__main__':
         if not re.fullmatch('[a-z\d_-]+@[a-z\d_-]+', login):
             raise Error("Invalid user/host name: '%s'" % login)
 
-        print_data(lambda owner: owner.get_auth(login), lambda owner: owner.get_permissions(login), 'for ' + login)
+        print_data(lambda owner: owner.get_auth(login), lambda owner: owner.get_permissions(login), 'generated for ' + login)
+
     else:
         raise Error("Unknown command '%s'." % command)
